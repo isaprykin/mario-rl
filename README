@@ -1,0 +1,12 @@
+A description of the current approach from my Whatsapp conversation with N. :
+
+I have two networks: a policy and a target network.  It's called double DQN and is supposed to reduce biases by splitting the evaluating the action and acting into two networks.  I'm confused whether it's technically a value network because there is another approach that is called dueling DQL where the target reward calculation is split into two parts: value [of the move] and advantage [of the state].  That has further benefits and there are two networks in that also and one is responsible for the value part...  On the other hand, in my configuration the target network is responsible for the Q values (what is the reward of an action?) so it could be called value network.
+
+Target network is another instance of the policy network.  It is not trained, rather periodically the weights of the policy network are copied into the target network.
+
+Target network is used inside the bellman target calculation where it updates the reward for the last action and needs to ask "how good is the best move from this new state?".  [cell 10]
+
+The inputs and outputs can be seen in cell 14.
+env is the mario environment.  It has a step() method which takes an action.  Currently there are 5 actions: 0 is no op, 1-4 are right and right + A/B/A+B.   Step returns four things: the new state, the reward of the last action, whether Mario is done (or died), and random info that's not used yet.
+
+The outputs are put into the replay buffer.  After every step() call, the program takes random 16 outputs and perform the training:  1) for each state among the 16, take the predicted Q values (rewards for the 5 actions.  2) for the action take, update the reward estimate (1 out of 5 numbers) (target network is used).  3) train the policy network with the x=state and y=the updated 5 numbers.

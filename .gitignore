@@ -1,0 +1,6 @@
+
+*.trace
+*.v2
+*.profile-empty
+*.pyc
+.ipynb_checkpoints/mario_dqn-checkpoint.ipynb
