@@ -23,8 +23,7 @@ def resize(state):
 def downsample(state):
     state = resize(state)
     state = greyscale(state)
-    # state = (state - 128) / 128
-    state = (state - 155) / 75
+    state = tf.image.per_image_standardization(state)
     return tf.cast(tf.reshape(state, (1,) + state_shape), tf.dtypes.bfloat16)  
 
 def policy(state):
@@ -37,10 +36,10 @@ while not done:
     state = downsample(state)
     action = policy(state)
     state, reward, done, info = env.step(action)
-    # print ('{} -> {} @ {} # {} | {}'.format(
-    #   action, reward,
-    #   info['x_pos'], episode_count,
-    #   model.predict(downsample(state))))
+    print ('{} -> {} @ {} # {} | {}'.format(
+      action, reward,
+      info['x_pos'], episode_count,
+      model.predict(downsample(state))))
     if done:
       break
     env.render()
