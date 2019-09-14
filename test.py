@@ -12,7 +12,7 @@ env = gym_super_mario_bros.make('SuperMarioBros-v0')
 env = JoypadSpace(env, RIGHT_ONLY)
 
 model = tf.keras.models.load_model('/tmp/mario0')
-state_shape = (56, 56, 1)
+state_shape = (84, 84, 1)
 
 def greyscale(state):
     return tf.image.rgb_to_grayscale([state])[0]
@@ -23,20 +23,30 @@ def resize(state):
 def downsample(state):
     state = resize(state)
     state = greyscale(state)
-    state = (state - 128) / 128    
+    # state = (state - 128) / 128
+    state = (state - 155) / 75
     return tf.cast(tf.reshape(state, (1,) + state_shape), tf.dtypes.bfloat16)  
 
 def policy(state):
   return np.argmax(model.predict(state))
 
 state = env.reset()
-for step in range(600):
+done = False
+episode_count = 0
+while not done:
     state = downsample(state)
     action = policy(state)
     state, reward, done, info = env.step(action)
-    print ('{} - {}'.format(reward, model.predict(downsample(state))))
+    # print ('{} -> {} @ {} # {} | {}'.format(
+    #   action, reward,
+    #   info['x_pos'], episode_count,
+    #   model.predict(downsample(state))))
     if done:
       break
     env.render()
+    episode_count += 1
 
 env.close()
+
+
+
