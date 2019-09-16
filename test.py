@@ -1,18 +1,21 @@
 # This file is for serving the model in Mario.
-# Use: $ python -m test 
+# Use: $ python -m test
+
+import collections
 
 from nes_py.wrappers import JoypadSpace
 import gym_super_mario_bros
 from gym_super_mario_bros.actions import RIGHT_ONLY
+from gym_super_mario_bros.actions import COMPLEX_MOVEMENT
 
 import tensorflow as tf
 import numpy as np
 
 env = gym_super_mario_bros.make('SuperMarioBros-v0')
-env = JoypadSpace(env, RIGHT_ONLY)
+env = JoypadSpace(env, COMPLEX_MOVEMENT)
 
 model = tf.keras.models.load_model('/tmp/mario0')
-state_shape = (84, 84, 1)
+state_shape = (84, 84)
 
 def greyscale(state):
     return tf.image.rgb_to_grayscale([state])[0]
@@ -26,26 +29,36 @@ def downsample(state):
     state = tf.image.per_image_standardization(state)
     return tf.cast(tf.reshape(state, (1,) + state_shape), tf.dtypes.bfloat16)  
 
-def policy(state):
-  return np.argmax(model.predict(state))
+def select_action(state):
+    if (np.random.random() < 0.05):
+        return np.random.choice(len(COMPLEX_MOVEMENT))
+    else:
+      state = tf.reshape(tf.concat(state, axis=0), (1,4,) + state_shape)
+      return np.argmax(model.predict(state))
 
-state = env.reset()
 done = False
 episode_count = 0
+overlapping_buffer = collections.deque(maxlen=4)
+state = downsample(env.reset())
+frame_states = [state, state, state, state]
 while not done:
-    state = downsample(state)
-    action = policy(state)
-    state, reward, done, info = env.step(action)
-    print ('{} -> {} @ {} # {} | {}'.format(
-      action, reward,
-      info['x_pos'], episode_count,
-      model.predict(downsample(state))))
-    if done:
-      break
-    env.render()
-    episode_count += 1
+  action = select_action(frame_states)
 
-env.close()
+  total_reward = 0
+  for _ in range(4):
+      state, reward, done, info = env.step(action)
+      if done: break
+      total_reward += reward
 
+  overlapping_buffer.append(downsample(state))
 
+  if len(overlapping_buffer) == overlapping_buffer.maxlen:
+      frame_states =  [s for s in overlapping_buffer]
+      print ('{} -> {} @ {} # {} | {}'.format(
+        action, total_reward,
+        info['x_pos'], episode_count,
+        model.predict(tf.reshape(tf.concat(frame_states, axis=0), (1,4,) + state_shape))))
+  env.render()
+  episode_count += 1
 
+env.close()      
