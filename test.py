@@ -13,9 +13,9 @@ import numpy as np
 
 env = gym_super_mario_bros.make('SuperMarioBros-v0')
 env = JoypadSpace(env, COMPLEX_MOVEMENT)
-
-model = tf.keras.models.load_model('/tmp/mario0')
 state_shape = (84, 84)
+        
+model = tf.keras.models.load_model('/tmp/models/mario0')
 
 def greyscale(state):
     return tf.image.rgb_to_grayscale([state])[0]
@@ -27,10 +27,10 @@ def downsample(state):
     state = resize(state)
     state = greyscale(state)
     state = tf.image.per_image_standardization(state)
-    return tf.cast(tf.reshape(state, (1,) + state_shape), tf.dtypes.bfloat16)  
+    return tf.cast(tf.reshape(state, (1,) + state_shape), tf.dtypes.float32)  
 
 def select_action(state):
-    if (np.random.random() < 0.05):
+    if (np.random.random() < 0.0):
         return np.random.choice(len(COMPLEX_MOVEMENT))
     else:
       state = tf.reshape(tf.concat(state, axis=0), (1,4,) + state_shape)
@@ -39,7 +39,11 @@ def select_action(state):
 done = False
 episode_count = 0
 overlapping_buffer = collections.deque(maxlen=4)
-state = downsample(env.reset())
+# state = downsample(env.reset())
+state = env.reset()
+for _ in range(np.random.randint(0, 133)):
+  state, _, _, _ = env.step(0)
+state = downsample(state)
 frame_states = [state, state, state, state]
 while not done:
   action = select_action(frame_states)
