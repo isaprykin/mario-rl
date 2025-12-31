@@ -4,3 +4,6 @@
 *.profile-empty
 *.pyc
 .ipynb_checkpoints/mario_dqn-checkpoint.ipynb
+.venv/*
+.models/*
+__pycache__/*
