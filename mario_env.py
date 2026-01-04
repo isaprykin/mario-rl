@@ -35,12 +35,9 @@ def _step_env(env, action):
 
 def _preprocess_frame(frame: np.ndarray, size: Tuple[int, int]) -> np.ndarray:
     """Convert RGB frame to grayscale resized uint8 array (H, W)."""
-    frame = tf.convert_to_tensor(frame)
     frame = tf.image.rgb_to_grayscale(frame)
     frame = tf.image.resize(frame, size, method=tf.image.ResizeMethod.NEAREST_NEIGHBOR)
-    frame = tf.squeeze(frame, axis=-1)
-    frame = tf.cast(frame, tf.uint8)
-    return frame.numpy()
+    return tf.cast(tf.squeeze(frame, axis=-1), tf.uint8).numpy()
 
 
 @dataclass

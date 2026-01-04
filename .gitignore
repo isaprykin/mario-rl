@@ -5,5 +5,5 @@
 *.pyc
 .ipynb_checkpoints/mario_dqn-checkpoint.ipynb
 .venv/*
-.models/*
+models/*
 __pycache__/*
