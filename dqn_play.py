@@ -12,6 +12,18 @@ import tensorflow as tf
 from mario_env import make_env
 
 
+def save_video(frames: list, output_path: str, fps: int = 30) -> None:
+    """Save frames to MP4 video."""
+    import imageio
+    import os
+
+    print(f"Saving {len(frames)} frames to {output_path}...")
+    imageio.mimsave(output_path, frames, fps=fps)
+
+    size_kb = os.path.getsize(output_path) / 1024
+    print(f"Saved: {output_path} ({size_kb:.1f} KB)")
+
+
 def configure_tf():
     gpus = tf.config.list_physical_devices("GPU")
     if gpus:
@@ -37,17 +49,25 @@ def play(args):
 
     model_dir = Path(args.model_dir)
     if model_dir.is_dir():
-        model_path = model_dir / "model.keras"
+        # Prefer best.keras, fall back to model.keras
+        best_path = model_dir / "best.keras"
+        model_path = best_path if best_path.exists() else model_dir / "model.keras"
     else:
         model_path = model_dir
     if not model_path.exists():
         raise FileNotFoundError(f"Model not found: {model_path}")
+    print(f"Loading model: {model_path}")
     model = tf.keras.models.load_model(model_path)
 
     state, _ = env.reset()
     done = False
     episode_reward = 0.0
     steps = 0
+    frames = []
+
+    # Capture initial frame if recording
+    if args.record:
+        frames.append(env.env.render(mode="rgb_array").copy())
 
     while not done:
         if args.random_action and np.random.random() < args.random_action:
@@ -58,11 +78,19 @@ def play(args):
         state, reward, done, info = env.step(action)
         episode_reward += reward
         steps += 1
-        if args.render:
+
+        if args.record:
+            frames.append(env.env.render(mode="rgb_array").copy())
+        elif args.render:
             env.render()
 
     env.close()
     print(f"Episode reward: {episode_reward:.2f}, steps: {steps}")
+
+    if args.record:
+        # Compute effective FPS: original game is 60fps, we skip frames
+        effective_fps = 60 // args.frame_skip
+        save_video(frames, args.record, fps=effective_fps)
 
 
 def build_arg_parser():
@@ -74,7 +102,8 @@ def build_arg_parser():
     parser.add_argument("--frame-stack", type=int, default=4)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--model-dir", default="models/mario_dqn")
-    parser.add_argument("--render", action="store_true")
+    parser.add_argument("--render", action="store_true", help="Display window (requires display)")
+    parser.add_argument("--record", type=str, default=None, metavar="FILE", help="Record to MP4 file")
     parser.add_argument("--random-action", type=float, default=0.0)
     return parser
 

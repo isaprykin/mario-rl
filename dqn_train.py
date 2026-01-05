@@ -560,6 +560,13 @@ def train(args: argparse.Namespace) -> None:
             mean_steps = float(np.mean(recent_steps)) if recent_steps else 0.0
             log_step(global_step, epsilon, mean_reward, mean_steps)
 
+        if args.save_interval > 0 and global_step % args.save_interval == 0 and global_step > 0:
+            model.save(model_path, overwrite=True, include_optimizer=False)
+            _save_state(state_path, {
+                "step": global_step, "episode": episode,
+                "epsilon": float(epsilon), "timestamp": time.time()
+            })
+
     model.save(model_path, overwrite=True, include_optimizer=False)
     _save_state(
         state_path,
@@ -622,7 +629,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     output = parser.add_argument_group("output")
     output.add_argument("--model-dir", default="models/mario_dqn")
     output.add_argument("--log-interval", type=int, default=50000)
-    output.add_argument("--save-best", action="store_true")
+    output.add_argument("--save-interval", type=int, default=100000, help="Save checkpoint every N steps")
+    output.add_argument("--save-best", action=argparse.BooleanOptionalAction, default=True)
     output.add_argument("--resume", action="store_true")
 
     perf = parser.add_argument_group("performance")
