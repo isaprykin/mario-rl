@@ -154,7 +154,7 @@ class ActorConfig:
     shm_weights_name: str
 
 
-def _actor_worker(conn, transition_queue, stats_queue, config: ActorConfig, shared_step, weight_version):
+def _actor_worker(conn, transition_queue, stats_queue, config: ActorConfig, shared_step, weight_version, dropped_transitions):
     """Actor process that collects transitions using its own environment and model."""
     os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
@@ -208,7 +208,8 @@ def _actor_worker(conn, transition_queue, stats_queue, config: ActorConfig, shar
             try:
                 transition_queue.put_nowait((state, action, reward, next_state, done))
             except queue.Full:
-                pass  # Drop if queue full - learner is behind
+                with dropped_transitions.get_lock():
+                    dropped_transitions.value += 1
 
             episode_return += reward
             episode_steps += 1
@@ -251,7 +252,7 @@ def configure_tf(use_mixed_precision: bool, enable_xla: bool, enable_mem_growth:
         print("No GPU detected. Training will run on CPU.")
 
 
-def _build_train_step(model, target_model, gamma: float):
+def _build_train_step(model, target_model, gamma: float, clip_norm: float | None = None):
     huber = tf.keras.losses.Huber(reduction=tf.keras.losses.Reduction.NONE)
     gamma_tf = tf.constant(gamma, dtype=tf.float32)
 
@@ -283,8 +284,17 @@ def _build_train_step(model, target_model, gamma: float):
             loss = tf.reduce_mean(loss * weights)
 
         grads = tape.gradient(loss, model.trainable_variables)
+        if clip_norm is not None and clip_norm > 0:
+            grads, grad_norm = tf.clip_by_global_norm(grads, clip_norm)
+        else:
+            grad_norm = tf.linalg.global_norm(grads)
         model.optimizer.apply_gradients(zip(grads, model.trainable_variables))
-        return td_errors, loss
+        
+        # Calculate Q-value stats for logging
+        mean_q = tf.reduce_mean(q_taken)
+        max_q = tf.reduce_max(q_taken)
+        
+        return td_errors, loss, mean_q, max_q, grad_norm
 
     return train_step
 
@@ -336,6 +346,7 @@ def train(args: argparse.Namespace) -> None:
     stats_queue = ctx.Queue()
     shared_step = ctx.Value("i", 0, lock=False)
     weight_version = ctx.Value("i", 0, lock=False)
+    dropped_transitions = ctx.Value("i", 0, lock=True)
 
     # Build a temporary model to get weight shapes
     temp_model = build_q_network(action_count, input_shape)
@@ -363,7 +374,7 @@ def train(args: argparse.Namespace) -> None:
         )
         parent_conn, child_conn = ctx.Pipe()
         proc = ctx.Process(target=_actor_worker, args=(
-            child_conn, transition_queue, stats_queue, config, shared_step, weight_version
+            child_conn, transition_queue, stats_queue, config, shared_step, weight_version, dropped_transitions
         ))
         proc.daemon = True
         proc.start()
@@ -396,7 +407,14 @@ def train(args: argparse.Namespace) -> None:
 
     target_model = build_q_network(action_count, input_shape, learning_rate=args.learning_rate)
     target_model.set_weights(model.get_weights())
-    train_step = _build_train_step(model, target_model, args.gamma)
+    train_step = _build_train_step(model, target_model, args.gamma, args.clip_norm)
+
+    # Estimate Replay Buffer Memory
+    # state = (frames, h, w), next_state same. 2 * capacity * prod(shape) bytes
+    # Plus overhead for actions, rewards, etc.
+    bytes_per_state = np.prod(input_shape)
+    estimated_bytes = args.replay_size * bytes_per_state * 2
+    print(f"Initializing Replay Buffer (capacity={args.replay_size}). Estimated state memory: {estimated_bytes / (1024**3):.2f} GB")
 
     replay = ReplayBuffer(args.replay_size, input_shape, alpha=args.prioritized_alpha)
 
@@ -409,6 +427,10 @@ def train(args: argparse.Namespace) -> None:
     start_time = time.time()
     recent_returns = deque(maxlen=ROLLING_WINDOW_SIZE)
     recent_steps = deque(maxlen=ROLLING_WINDOW_SIZE)
+    recent_losses = deque(maxlen=ROLLING_WINDOW_SIZE)
+    recent_mean_qs = deque(maxlen=ROLLING_WINDOW_SIZE)
+    recent_max_qs = deque(maxlen=ROLLING_WINDOW_SIZE)
+    recent_grad_norms = deque(maxlen=ROLLING_WINDOW_SIZE)
     last_log_time = time.time()
     last_log_step = global_step
     last_timing_step = global_step
@@ -433,7 +455,7 @@ def train(args: argparse.Namespace) -> None:
                 timing.add("replay_sample", time.perf_counter() - t0)
 
             t1 = time.perf_counter()
-            td_errors, _ = train_step(
+            td_errors, loss, mean_q, max_q, grad_norm = train_step(
                 batch_states,
                 actions,
                 rewards,
@@ -442,6 +464,13 @@ def train(args: argparse.Namespace) -> None:
                 weights,
             )
             td_errors = td_errors.numpy()
+            
+            # Update stats
+            recent_losses.append(float(loss))
+            recent_mean_qs.append(float(mean_q))
+            recent_max_qs.append(float(max_q))
+            recent_grad_norms.append(float(grad_norm))
+
             if timing:
                 timing.add("train_step", time.perf_counter() - t1)
             replay.update_priorities(indices, td_errors)
@@ -450,15 +479,36 @@ def train(args: argparse.Namespace) -> None:
         nonlocal last_log_time, last_log_step, last_timing_step
         now = time.time()
         elapsed = now - start_time
+        
+        avg_loss = np.mean(recent_losses) if recent_losses else 0.0
+        avg_mean_q = np.mean(recent_mean_qs) if recent_mean_qs else 0.0
+        avg_max_q = np.mean(recent_max_qs) if recent_max_qs else 0.0
+        avg_grad_norm = np.mean(recent_grad_norms) if recent_grad_norms else 0.0
+        
+        # Calculate queue stats
+        q_size = transition_queue.qsize()
+        with dropped_transitions.get_lock():
+            total_drops = dropped_transitions.value
+            dropped_transitions.value = 0 # Reset for next interval
+            
+        time_delta = max(1e-6, now - last_log_time)
+        step_delta = max(1, step - last_log_step)
+        sps = step_delta / time_delta
+        drops_ps = total_drops / time_delta
+        
         with writer.as_default():
             tf.summary.scalar("epsilon", eps, step=step)
             tf.summary.scalar("episode_reward_mean", mean_reward, step=step)
             tf.summary.scalar("replay_size", len(replay), step=step)
             tf.summary.scalar("episode_steps_mean", mean_steps, step=step)
             tf.summary.scalar("wall_time_seconds", elapsed, step=step)
-        step_delta = max(1, step - last_log_step)
-        time_delta = max(1e-6, now - last_log_time)
-        sps = step_delta / time_delta
+            tf.summary.scalar("loss", avg_loss, step=step)
+            tf.summary.scalar("q_value_mean", avg_mean_q, step=step)
+            tf.summary.scalar("q_value_max", avg_max_q, step=step)
+            tf.summary.scalar("grad_norm", avg_grad_norm, step=step)
+            tf.summary.scalar("queue_size", q_size, step=step)
+            tf.summary.scalar("drops_per_second", drops_ps, step=step)
+            
         timing_summary = ""
         if timing and (step - last_timing_step) >= args.timing_interval:
             summary = timing.summary_and_reset()
@@ -466,9 +516,9 @@ def train(args: argparse.Namespace) -> None:
                 timing_summary = f" timing[{summary}]"
             last_timing_step = step
         print(
-            f"[step {step}] ep {episode} mean_ep_steps {mean_steps:.1f} "
-            f"mean_ep_reward {mean_reward:.2f} epsilon {eps:.3f} "
-            f"replay {len(replay)} sps {sps:.1f} wall {elapsed:.1f}s{timing_summary}",
+            f"[step {step}] ep {episode} rw {mean_reward:.2f} len {mean_steps:.1f} "
+            f"loss {avg_loss:.4f} q {avg_mean_q:.2f} gn {avg_grad_norm:.2f} "
+            f"eps {eps:.3f} sps {sps:.1f} drops {drops_ps:.1f}{timing_summary}",
             flush=True,
         )
         last_log_time = now
@@ -492,12 +542,6 @@ def train(args: argparse.Namespace) -> None:
             tf.summary.scalar("episode_steps", ep_steps, step=global_step)
             tf.summary.scalar("episode_wall_time_seconds", elapsed, step=global_step)
 
-        print(
-            f"[episode {episode}] return {ep_return:.2f} "
-            f"steps {ep_steps} total_step {global_step} "
-            f"ma100 {rolling_mean:.2f} wall {elapsed:.1f}s",
-            flush=True,
-        )
         episode += 1
 
     # Write initial weights to shared memory and signal actors
@@ -602,15 +646,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     env.add_argument("--seed", type=int, default=None)
 
     actors = parser.add_argument_group("parallelism")
-    actors.add_argument("--num-actors", type=int, default=4)
+    actors.add_argument("--num-actors", type=int, default=8)
     actors.add_argument("--actor-sync-interval", type=int, default=1000)
     actors.add_argument("--actor-queue-size", type=int, default=DEFAULT_QUEUE_SIZE)
 
     train = parser.add_argument_group("training")
     train.add_argument("--learning-rate", type=float, default=1e-4)
     train.add_argument("--gamma", type=float, default=0.99)
-    train.add_argument("--batch-size", type=int, default=64)
-    train.add_argument("--replay-size", type=int, default=20000)
+    train.add_argument("--batch-size", type=int, default=128)
+    train.add_argument("--clip-norm", type=float, default=1.0)
+    train.add_argument("--replay-size", type=int, default=100000)
     train.add_argument("--train-freq", type=int, default=2)
     train.add_argument("--prefetch-steps", type=int, default=0)
     train.add_argument("--target-update", type=int, default=10000)
@@ -619,7 +664,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     explore = parser.add_argument_group("exploration")
     explore.add_argument("--eps-start", type=float, default=1.0)
     explore.add_argument("--eps-final", type=float, default=0.05)
-    explore.add_argument("--eps-decay", type=int, default=200000)
+    explore.add_argument("--eps-decay", type=int, default=1_000_000)
 
     per = parser.add_argument_group("prioritized replay")
     per.add_argument("--prioritized-alpha", type=float, default=0.6)
@@ -628,7 +673,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     output = parser.add_argument_group("output")
     output.add_argument("--model-dir", default="models/mario_dqn")
-    output.add_argument("--log-interval", type=int, default=50000)
+    output.add_argument("--log-interval", type=int, default=25000)
     output.add_argument("--save-interval", type=int, default=100000, help="Save checkpoint every N steps")
     output.add_argument("--save-best", action=argparse.BooleanOptionalAction, default=True)
     output.add_argument("--resume", action="store_true")

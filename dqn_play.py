@@ -49,9 +49,14 @@ def play(args):
 
     model_dir = Path(args.model_dir)
     if model_dir.is_dir():
-        # Prefer best.keras, fall back to model.keras
         best_path = model_dir / "best.keras"
-        model_path = best_path if best_path.exists() else model_dir / "model.keras"
+        latest_path = model_dir / "model.keras"
+        
+        if args.latest:
+            model_path = latest_path if latest_path.exists() else best_path
+        else:
+            # Prefer best.keras, fall back to model.keras
+            model_path = best_path if best_path.exists() else latest_path
     else:
         model_path = model_dir
     if not model_path.exists():
@@ -105,6 +110,7 @@ def build_arg_parser():
     parser.add_argument("--render", action="store_true", help="Display window (requires display)")
     parser.add_argument("--record", type=str, default=None, metavar="FILE", help="Record to MP4 file")
     parser.add_argument("--random-action", type=float, default=0.0)
+    parser.add_argument("--latest", action="store_true", help="Load the latest model instead of the best model")
     return parser
 
 
