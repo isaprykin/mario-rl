@@ -8,6 +8,7 @@ import json
 import multiprocessing as mp
 import os
 import queue
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -417,6 +418,34 @@ def train(args: argparse.Namespace) -> None:
     print(f"Initializing Replay Buffer (capacity={args.replay_size}). Estimated state memory: {estimated_bytes / (1024**3):.2f} GB")
 
     replay = ReplayBuffer(args.replay_size, input_shape, alpha=args.prioritized_alpha)
+    replay_lock = threading.Lock()
+
+    # Prefetching setup
+    batch_queue = queue.Queue(maxsize=3)
+    stop_event = threading.Event()
+
+    def prefetch_worker():
+        while not stop_event.is_set():
+            with replay_lock:
+                size = len(replay)
+            
+            if size < args.batch_size or size < args.prefetch_steps:
+                time.sleep(0.01)
+                continue
+            
+            step = shared_step.value
+            beta = _beta_by_step(step, args.beta_start, args.beta_frames)
+            
+            with replay_lock:
+                batch = replay.sample(args.batch_size, beta=beta)
+            
+            try:
+                batch_queue.put(batch, timeout=0.1)
+            except queue.Full:
+                continue
+
+    prefetch_thread = threading.Thread(target=prefetch_worker, daemon=True)
+    prefetch_thread.start()
 
     writer = tf.summary.create_file_writer(str(model_dir / "logs"))
 
@@ -439,41 +468,47 @@ def train(args: argparse.Namespace) -> None:
     def train_on_replay(step):
         if step < args.prefetch_steps:
             return
-        if len(replay) >= args.batch_size and step % args.train_freq == 0:
-            beta = _beta_by_step(step, args.beta_start, args.beta_frames)
-            t0 = time.perf_counter()
-            (
-                batch_states,
-                actions,
-                rewards,
-                next_states,
-                dones,
-                indices,
-                weights,
-            ) = replay.sample(args.batch_size, beta=beta)
-            if timing:
-                timing.add("replay_sample", time.perf_counter() - t0)
+        if step % args.train_freq == 0:
+            try:
+                t0 = time.perf_counter()
+                batch = batch_queue.get(timeout=2.0)
+                (
+                    batch_states,
+                    actions,
+                    rewards,
+                    next_states,
+                    dones,
+                    indices,
+                    weights,
+                ) = batch
+                
+                if timing:
+                    timing.add("queue_get", time.perf_counter() - t0)
 
-            t1 = time.perf_counter()
-            td_errors, loss, mean_q, max_q, grad_norm = train_step(
-                batch_states,
-                actions,
-                rewards,
-                next_states,
-                dones,
-                weights,
-            )
-            td_errors = td_errors.numpy()
-            
-            # Update stats
-            recent_losses.append(float(loss))
-            recent_mean_qs.append(float(mean_q))
-            recent_max_qs.append(float(max_q))
-            recent_grad_norms.append(float(grad_norm))
+                t1 = time.perf_counter()
+                td_errors, loss, mean_q, max_q, grad_norm = train_step(
+                    batch_states,
+                    actions,
+                    rewards,
+                    next_states,
+                    dones,
+                    weights,
+                )
+                td_errors = td_errors.numpy()
+                
+                # Update stats
+                recent_losses.append(float(loss))
+                recent_mean_qs.append(float(mean_q))
+                recent_max_qs.append(float(max_q))
+                recent_grad_norms.append(float(grad_norm))
 
-            if timing:
-                timing.add("train_step", time.perf_counter() - t1)
-            replay.update_priorities(indices, td_errors)
+                if timing:
+                    timing.add("train_step", time.perf_counter() - t1)
+                
+                with replay_lock:
+                    replay.update_priorities(indices, td_errors)
+            except queue.Empty:
+                pass
 
     def log_step(step, eps, mean_reward, mean_steps):
         nonlocal last_log_time, last_log_step, last_timing_step
@@ -554,7 +589,8 @@ def train(args: argparse.Namespace) -> None:
     def add_transition(trans):
         nonlocal global_step
         state, action, reward, next_state, done = trans
-        replay.add(state, action, np.clip(reward, -1.0, 1.0), next_state, done)
+        with replay_lock:
+            replay.add(state, action, np.clip(reward, -1.0, 1.0), next_state, done)
         global_step += 1
 
     while global_step < args.total_steps:
